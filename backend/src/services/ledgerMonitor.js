@@ -6,7 +6,7 @@
  * Reconnects with exponential backoff on stream errors.
  */
 
-const { server } = require("../config/stellar");
+const { server, configuredAssets } = require("../config/stellar");
 const db = require("../config/database");
 const logger = require("../config/logger");
 const { markContributionIndexed } = require("./stellarTransactionService");
@@ -215,6 +215,66 @@ async function onPaymentRecord(campaignId, walletPublicKey, record) {
   }
 }
 
+/**
+ * Records a mismatched-asset payment for audit instead of crediting it. Dedups
+ * on tx_hash so REST replay / stream redelivery doesn't spam quarantine rows.
+ */
+async function quarantinePayment({
+  campaignId,
+  walletPublicKey,
+  senderPublicKey,
+  txHash,
+  assetCode,
+  assetIssuer,
+  amount,
+  expectedAssetType,
+  reason,
+}) {
+  try {
+    await db.query(
+      `INSERT INTO quarantined_payments
+         (campaign_id, wallet_public_key, sender_public_key, tx_hash, asset_code,
+          asset_issuer, amount, expected_asset_type, reason)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       ON CONFLICT (tx_hash) DO NOTHING`,
+      [
+        campaignId,
+        walletPublicKey,
+        senderPublicKey,
+        txHash,
+        assetCode || null,
+        assetIssuer || null,
+        amount,
+        expectedAssetType,
+        reason,
+      ],
+    );
+  } catch (err) {
+    logger.error("Failed to persist quarantined payment", {
+      campaign_id: campaignId,
+      tx_hash: txHash,
+      error: err.message,
+    });
+  }
+
+  Sentry.withScope((scope) => {
+    scope.setTag("stellar.network", process.env.STELLAR_NETWORK);
+    scope.setExtra("tx_hash", txHash);
+    scope.setExtra("campaign_id", campaignId);
+    scope.setExtra("asset_code", assetCode);
+    scope.setExtra("asset_issuer", assetIssuer);
+    Sentry.captureMessage(`Quarantined mismatched-asset payment: ${reason}`, "warning");
+  });
+  logger.warn("Quarantined mismatched-asset payment", {
+    campaign_id: campaignId,
+    tx_hash: txHash,
+    asset_code: assetCode,
+    asset_issuer: assetIssuer,
+    expected_asset_type: expectedAssetType,
+    reason,
+  });
+}
+
 async function handlePayment(campaignId, walletPublicKey, payment) {
   if (payment.to !== walletPublicKey) return;
   if (
@@ -224,7 +284,7 @@ async function handlePayment(campaignId, walletPublicKey, payment) {
     return;
 
   const { rows: campaignRows } = await db.query(
-    "SELECT status, wallet_mode FROM campaigns WHERE id = $1",
+    "SELECT status, asset_type, wallet_mode FROM campaigns WHERE id = $1",
     [campaignId],
   );
   if (
@@ -232,6 +292,7 @@ async function handlePayment(campaignId, walletPublicKey, payment) {
     !["active", "funded"].includes(campaignRows[0].status)
   )
     return;
+  const expectedAssetType = campaignRows[0].asset_type;
 
   const destinationAsset =
     payment.asset_type === "native" ? "XLM" : payment.asset_code;
@@ -254,6 +315,71 @@ async function handlePayment(campaignId, walletPublicKey, payment) {
     sourceAmount && destinationAmount ? destinationAmount / sourceAmount : null;
   const txHash = payment.transaction_hash;
 
+  // #707: only credit payments in the campaign's own configured asset, from
+  // the trusted issuer for that asset code. Anything else is quarantined —
+  // never folded into raised_amount, rewards, referrals, or notifications.
+  const expectedAssetConfig = configuredAssets[expectedAssetType];
+  const assetMatches =
+    destinationAsset === expectedAssetType &&
+    (payment.asset_type === "native" ||
+      (expectedAssetConfig && payment.asset_issuer === expectedAssetConfig.issuer));
+  if (!assetMatches) {
+    await quarantinePayment({
+      campaignId,
+      walletPublicKey,
+      senderPublicKey: payment.from,
+      txHash,
+      assetCode: destinationAsset,
+      assetIssuer: payment.asset_issuer || null,
+      amount: destinationAmount,
+      expectedAssetType,
+      reason:
+        destinationAsset !== expectedAssetType
+          ? `asset code ${destinationAsset} does not match campaign asset ${expectedAssetType}`
+          : `untrusted issuer for ${destinationAsset}`,
+    });
+    return;
+  }
+
+  await recordConfirmedContribution({
+    campaignId,
+    walletPublicKey,
+    senderPublicKey: payment.from,
+    destinationAmount,
+    destinationAsset,
+    sourceAsset,
+    sourceAmount,
+    path,
+    paymentType,
+    conversionRate,
+    txHash,
+    walletMode: campaignRows[0].wallet_mode,
+  });
+}
+
+/**
+ * Finalizes a confirmed on-chain payment as a contribution: inserts the
+ * `contributions` row, updates campaign raised_amount/status, assigns a
+ * reward tier, marks the matching `stellar_transactions` row indexed, and
+ * fires all downstream side effects (referrals, sponsor matching, receipts,
+ * webhooks, fraud/badge/follow hooks). Used both by the classic Horizon
+ * payment stream (`handlePayment`) and by contract-mode deposits, which
+ * confirm synchronously right after submission instead of via ledger replay.
+ */
+async function recordConfirmedContribution({
+  campaignId,
+  walletPublicKey,
+  senderPublicKey,
+  destinationAmount,
+  destinationAsset,
+  sourceAsset = null,
+  sourceAmount = null,
+  path = null,
+  paymentType,
+  conversionRate = null,
+  txHash,
+  walletMode = null,
+}) {
   const client = await db.connect();
   let postCommitHooks = null;
   try {
@@ -303,7 +429,7 @@ async function handlePayment(campaignId, walletPublicKey, payment) {
        RETURNING id`,
       [
         campaignId,
-        payment.from,
+        senderPublicKey,
         destinationAmount,
         destinationAsset,
         anchorMetadata?.anchor_id || null,
@@ -413,7 +539,7 @@ async function handlePayment(campaignId, walletPublicKey, payment) {
         id: inserted[0].id,
         campaign_id: campaignId,
         tx_hash: txHash,
-        sender_public_key: payment.from,
+        sender_public_key: senderPublicKey,
         amount: String(destinationAmount),
         asset: destinationAsset,
         payment_type: paymentType,
@@ -426,7 +552,7 @@ async function handlePayment(campaignId, walletPublicKey, payment) {
         txHash,
         amount: destinationAmount,
         asset: destinationAsset,
-        senderPublicKey: payment.from,
+        senderPublicKey,
       },
     };
     logger.info("Contribution indexed", {
@@ -442,7 +568,7 @@ async function handlePayment(campaignId, walletPublicKey, payment) {
       contribution: {
         id: inserted[0].id,
         campaign_id: campaignId,
-        sender_public_key: payment.from,
+        sender_public_key: senderPublicKey,
         amount: destinationAmount,
         asset: destinationAsset,
         payment_type: paymentType,
@@ -461,10 +587,10 @@ async function handlePayment(campaignId, walletPublicKey, payment) {
     // treasury's totals track the ledger. This runs after COMMIT and never
     // throws: the contribution is already recorded and confirmed on Stellar, so
     // a Soroban hiccup must not undo it — it is logged for retry instead.
-    if (campaignRows[0].wallet_mode === "contract") {
+    if (walletMode === "contract") {
       try {
         await indexTreasuryContribution(campaignId, {
-          contributor: payment.from,
+          contributor: senderPublicKey,
           amount: String(destinationAmount),
           txHash,
         });
@@ -805,6 +931,7 @@ async function handlePayment(campaignId, walletPublicKey, payment) {
     startLedgerMonitor,
     watchCampaignWallet,
     handlePayment,
+    recordConfirmedContribution,
     reconcileCampaignBalances: runBalanceReconciliation,
     getLedgerStreamHealth,
     addSSEClient,

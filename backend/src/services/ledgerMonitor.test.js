@@ -32,7 +32,12 @@ function buildLedgerMonitor(mockQuery, treasuryStub) {
 
   const ledgerMonitor = proxyquire('./ledgerMonitor', {
     '../config/database': mockDb,
-    '../config/stellar': { server: {} },
+    '../config/stellar': {
+      server: {},
+      configuredAssets: {
+        XLM: { type: 'native' },
+        USDC: { type: 'credit_alphanum4', issuer: 'GTRUSTEDUSDCISSUER' },
+      },
     '../config/logger': {
       info: () => {},
       warn: () => {},
@@ -74,7 +79,9 @@ function buildLedgerMonitor(mockQuery, treasuryStub) {
 test('handlePayment updates stellar_transactions when a contribution row is created', async () => {
   const stellarUpdates = [];
   const mockQuery = async (text, params) => {
-    if (text.includes('SELECT status, wallet_mode FROM campaigns')) return { rows: [{ status: 'active', wallet_mode: 'standard' }] };
+    if (text.includes('SELECT status, asset_type, wallet_mode FROM campaigns')) {
+      return { rows: [{ status: 'active', asset_type: 'XLM', wallet_mode: 'standard' }] };
+    }
     if (text.includes('SELECT id FROM contributions')) return { rows: [] };
     if (text.includes('SELECT creator_id FROM campaigns')) {
       return { rows: [{ creator_id: 'user-creator' }] };
@@ -126,7 +133,9 @@ test('handlePayment updates stellar_transactions when a contribution row is crea
 test('handlePayment accepts contributions on funded campaigns', async () => {
   let insertCalled = false;
   const mockQuery = async (text) => {
-    if (text.includes('SELECT status, wallet_mode FROM campaigns')) return { rows: [{ status: 'funded', wallet_mode: 'standard' }] };
+    if (text.includes('SELECT status, asset_type, wallet_mode FROM campaigns')) {
+      return { rows: [{ status: 'funded', asset_type: 'XLM', wallet_mode: 'standard' }] };
+    }
     if (text.includes('SELECT id FROM contributions')) return { rows: [] };
     if (text.includes('SELECT creator_id FROM campaigns')) {
       return { rows: [{ creator_id: 'user-creator' }] };
@@ -160,11 +169,167 @@ test('handlePayment accepts contributions on funded campaigns', async () => {
   assert.equal(insertCalled, true);
 });
 
+test('handlePayment quarantines a payment whose asset code does not match campaign.asset_type', async () => {
+  let contributionInsertCalled = false;
+  let raisedAmountUpdateCalled = false;
+  const quarantineInserts = [];
+  const mockQuery = async (text, params) => {
+    if (text.includes('SELECT status, asset_type, wallet_mode FROM campaigns')) {
+      return { rows: [{ status: 'active', asset_type: 'XLM', wallet_mode: 'standard' }] };
+    }
+    if (text.includes('INSERT INTO quarantined_payments')) {
+      quarantineInserts.push({ text, params });
+      return { rows: [] };
+    }
+    if (text.includes('INSERT INTO contributions')) {
+      contributionInsertCalled = true;
+      return { rows: [{ id: 'contrib-id' }] };
+    }
+    return { rows: [] };
+  };
+
+  const { ledgerMonitor, updates } = buildLedgerMonitor(mockQuery);
+
+  await ledgerMonitor.handlePayment('camp-1', 'GWALLET', {
+    to: 'GWALLET',
+    from: 'GFROM',
+    type: 'payment',
+    asset_type: 'credit_alphanum4',
+    asset_code: 'USDC',
+    asset_issuer: 'GTRUSTEDUSDCISSUER',
+    amount: '50',
+    transaction_hash: 'txhash-wrong-asset',
+  });
+
+  if (updates.length) raisedAmountUpdateCalled = true;
+
+  assert.equal(quarantineInserts.length, 1);
+  assert.equal(quarantineInserts[0].params[3], 'txhash-wrong-asset'); // tx_hash
+  assert.equal(quarantineInserts[0].params[4], 'USDC'); // asset_code
+  assert.equal(quarantineInserts[0].params[7], 'XLM'); // expected_asset_type
+  assert.equal(contributionInsertCalled, false);
+  assert.equal(raisedAmountUpdateCalled, false);
+});
+
+test('handlePayment quarantines a payment with a matching asset code but an untrusted issuer', async () => {
+  const quarantineInserts = [];
+  let contributionInsertCalled = false;
+  const mockQuery = async (text, params) => {
+    if (text.includes('SELECT status, asset_type, wallet_mode FROM campaigns')) {
+      return { rows: [{ status: 'active', asset_type: 'USDC', wallet_mode: 'standard' }] };
+    }
+    if (text.includes('INSERT INTO quarantined_payments')) {
+      quarantineInserts.push({ text, params });
+      return { rows: [] };
+    }
+    if (text.includes('INSERT INTO contributions')) {
+      contributionInsertCalled = true;
+      return { rows: [{ id: 'contrib-id' }] };
+    }
+    return { rows: [] };
+  };
+
+  const { ledgerMonitor } = buildLedgerMonitor(mockQuery);
+
+  await ledgerMonitor.handlePayment('camp-1', 'GWALLET', {
+    to: 'GWALLET',
+    from: 'GFROM',
+    type: 'payment',
+    asset_type: 'credit_alphanum4',
+    asset_code: 'USDC',
+    asset_issuer: 'GATTACKERISSUER',
+    amount: '50',
+    transaction_hash: 'txhash-bad-issuer',
+  });
+
+  assert.equal(quarantineInserts.length, 1);
+  assert.equal(quarantineInserts[0].params[5], 'GATTACKERISSUER'); // asset_issuer
+  assert.equal(contributionInsertCalled, false);
+});
+
+test('handlePayment credits a matching-issuer USDC payment against a USDC campaign', async () => {
+  let contributionInsertCalled = false;
+  const mockQuery = async (text) => {
+    if (text.includes('SELECT status, asset_type, wallet_mode FROM campaigns')) {
+      return { rows: [{ status: 'active', asset_type: 'USDC', wallet_mode: 'standard' }] };
+    }
+    if (text.includes('SELECT id FROM contributions')) return { rows: [] };
+    if (text.includes('SELECT creator_id FROM campaigns')) {
+      return { rows: [{ creator_id: 'user-creator' }] };
+    }
+    if (text.includes('SELECT metadata FROM stellar_transactions')) {
+      return { rows: [{ metadata: {} }] };
+    }
+    if (text === 'BEGIN') return { rows: [] };
+    if (text.includes('INSERT INTO contributions')) {
+      contributionInsertCalled = true;
+      return { rows: [{ id: 'contrib-id' }] };
+    }
+    if (text.includes('SELECT raised_amount FROM campaigns')) {
+      return { rows: [{ raised_amount: '50' }] };
+    }
+    if (text === 'COMMIT') return { rows: [] };
+    return { rows: [] };
+  };
+
+  const { ledgerMonitor } = buildLedgerMonitor(mockQuery);
+
+  await ledgerMonitor.handlePayment('camp-1', 'GWALLET', {
+    to: 'GWALLET',
+    from: 'GFROM',
+    type: 'payment',
+    asset_type: 'credit_alphanum4',
+    asset_code: 'USDC',
+    asset_issuer: 'GTRUSTEDUSDCISSUER',
+    amount: '50',
+    transaction_hash: 'txhash-good-usdc',
+  });
+
+  assert.equal(contributionInsertCalled, true);
+});
+
+test('recordConfirmedContribution can be invoked directly (used by contract-mode deposits)', async () => {
+  let contributionInsertCalled = false;
+  const mockQuery = async (text) => {
+    if (text.includes('SELECT id FROM contributions')) return { rows: [] };
+    if (text.includes('SELECT creator_id FROM campaigns')) {
+      return { rows: [{ creator_id: 'user-creator' }] };
+    }
+    if (text.includes('SELECT metadata FROM stellar_transactions')) {
+      return { rows: [{ metadata: {} }] };
+    }
+    if (text === 'BEGIN') return { rows: [] };
+    if (text.includes('INSERT INTO contributions')) {
+      contributionInsertCalled = true;
+      return { rows: [{ id: 'contrib-id' }] };
+    }
+    if (text.includes('SELECT raised_amount FROM campaigns')) {
+      return { rows: [{ raised_amount: '50' }] };
+    }
+    if (text === 'COMMIT') return { rows: [] };
+    return { rows: [] };
+  };
+
+  const { ledgerMonitor } = buildLedgerMonitor(mockQuery);
+
+  await ledgerMonitor.recordConfirmedContribution({
+    campaignId: 'camp-1',
+    walletPublicKey: null,
+    senderPublicKey: 'GFROM',
+    destinationAmount: 50,
+    destinationAsset: 'USDC',
+    paymentType: 'contract_deposit',
+    txHash: 'txhash-contract-deposit',
+  });
+
+  assert.equal(contributionInsertCalled, true);
+});
+
 /** Query stub for a contract-mode campaign that reaches the end of handlePayment. */
 function contractModeQuery(seen = {}) {
   return async (text) => {
-    if (text.includes('SELECT status, wallet_mode FROM campaigns')) {
-      return { rows: [{ status: 'active', wallet_mode: 'contract' }] };
+    if (text.includes('SELECT status, asset_type, wallet_mode FROM campaigns')) {
+      return { rows: [{ status: 'active', asset_type: 'XLM', wallet_mode: 'contract' }] };
     }
     if (text.includes('SELECT id FROM contributions')) return { rows: [] };
     if (text.includes('SELECT creator_id FROM campaigns')) {
