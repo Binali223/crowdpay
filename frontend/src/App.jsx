@@ -38,6 +38,7 @@ const CreatorProfile = lazy(() => import('./pages/CreatorProfile'));
 const CreatorAnalytics = lazy(() => import('./pages/CreatorAnalytics'));
 const CreatorCampaignAnalytics = lazy(() => import('./pages/CreatorCampaignAnalytics'));
 const Governance = lazy(() => import('./pages/Governance'));
+const OpsCenter = lazy(() => import('./pages/OpsCenter'));
 
 function PrivateRoute({ children }) {
   const { user, ready } = useAuth();
@@ -164,6 +165,10 @@ export default function App() {
                 <Route
                   path="/governance"
                   element={<Governance />}
+                />
+                <Route
+                  path="/ops"
+                  element={<OpsCenter />}
                 />
                 <Route
                   path="/my-contributions"
