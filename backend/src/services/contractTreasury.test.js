@@ -355,7 +355,9 @@ test('approving a pending withdrawal completes exactly that row', async () => {
   let updateParams;
   const { service, calls } = build({
     queryImpl: async (text, params) => {
-      if (text.includes('FROM campaigns')) return { rows: [campaignRow()] };
+      if (text.includes('FROM campaigns')) {
+        return { rows: [campaignRow({ auditor_public_key: AUDITOR })] };
+      }
       if (text.includes('FROM users')) {
         return { rows: [userRow({ wallet_public_key: AUDITOR, wallet_secret_encrypted: 'auditor-secret' })] };
       }
@@ -393,7 +395,9 @@ test('approving without an authenticated approver is rejected before touching th
 test('approving an id the database does not hold is a 404', async () => {
   const { service } = build({
     queryImpl: async (text) => {
-      if (text.includes('FROM campaigns')) return { rows: [campaignRow()] };
+      if (text.includes('FROM campaigns')) {
+        return { rows: [campaignRow({ auditor_public_key: AUDITOR })] };
+      }
       if (text.includes('FROM users')) {
         return { rows: [userRow({ wallet_public_key: AUDITOR, wallet_secret_encrypted: 'auditor-secret' })] };
       }
@@ -404,6 +408,69 @@ test('approving an id the database does not hold is a 404', async () => {
     () => service.approvePendingWithdrawal(CAMPAIGN_ID, 99, { approverId: 'auditor-1' }),
     (err) => err.code === 'PENDING_NOT_FOUND' && err.statusCode === 404
   );
+});
+
+test('auditor whose wallet does not match the campaign auditor key is rejected', async () => {
+  const { service, calls } = build({
+    queryImpl: async (text) => {
+      if (text.includes('FROM campaigns')) {
+        // Campaign expects a different auditor than the one calling.
+        return { rows: [campaignRow({ auditor_public_key: CREATOR })] };
+      }
+      if (text.includes('FROM users')) {
+        return { rows: [userRow({ wallet_public_key: AUDITOR, wallet_secret_encrypted: 'auditor-secret' })] };
+      }
+      return { rows: [] };
+    },
+  });
+
+  await assert.rejects(
+    () => service.approvePendingWithdrawal(CAMPAIGN_ID, 7, { approverId: 'auditor-1' }),
+    (err) => err.code === 'AUDITOR_MISMATCH' && err.statusCode === 403
+  );
+  assert.equal(calls.length, 0, 'must not reach the contract when the auditor mismatches');
+});
+
+test('a Freighter-only auditor cannot approve from the server', async () => {
+  const { service, calls } = build({
+    queryImpl: async (text) => {
+      if (text.includes('FROM campaigns')) {
+        return { rows: [campaignRow({ auditor_public_key: AUDITOR })] };
+      }
+      if (text.includes('FROM users')) {
+        return { rows: [userRow({ wallet_type: 'freighter', wallet_public_key: AUDITOR, wallet_secret_encrypted: null })] };
+      }
+      return { rows: [] };
+    },
+  });
+
+  await assert.rejects(
+    () => service.approvePendingWithdrawal(CAMPAIGN_ID, 7, { approverId: 'auditor-1' }),
+    (err) => err.code === 'FREIGHTER_SIGNING_UNSUPPORTED' && err.statusCode === 501
+  );
+  assert.equal(calls.length, 0);
+});
+
+test('the auditor and platform accounts are distinct: approval signs with the auditor key', async () => {
+  const { service, calls } = build({
+    queryImpl: async (text) => {
+      if (text.includes('FROM campaigns')) {
+        return { rows: [campaignRow({ auditor_public_key: AUDITOR })] };
+      }
+      if (text.includes('FROM users')) {
+        return { rows: [userRow({ wallet_public_key: AUDITOR, wallet_secret_encrypted: 'auditor-secret' })] };
+      }
+      if (text.includes('UPDATE withdrawal_requests')) {
+        return { rows: [{ id: 'w-2', status: 'completed', amount: '9000.0000000' }] };
+      }
+      return { rows: [] };
+    },
+  });
+
+  await service.approvePendingWithdrawal(CAMPAIGN_ID, 7, { approverId: 'auditor-1' });
+  assert.equal(calls[0].signerSecret, 'auditor-secret');
+  assert.notEqual(calls[0].signerSecret, process.env.PLATFORM_SECRET_KEY,
+    'approval must use the auditor key, not the platform key');
 });
 
 // ── live status ──────────────────────────────────────────────────────────────
