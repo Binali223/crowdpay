@@ -1,5 +1,8 @@
 node_modules/
 
+# Test coverage output
+coverage/
+
 # Environment files — never commit real secrets
 .env
 .env.*
@@ -32,3 +35,6 @@ npm-debug.log*
 
 # Docker
 .dockerignore.soroban/
+branch_structure.json
+temp_auto_push.bat
+temp_interactive_push.bat
