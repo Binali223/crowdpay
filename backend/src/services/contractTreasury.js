@@ -404,6 +404,10 @@ async function approvePendingWithdrawal(campaignId, pendingId, { approverId } = 
   }
   const auditor = await loadCustodialSigner(approverId, 'auditor', 'AUDITOR_WALLET_MISSING');
 
+  if (campaign.auditor_public_key && auditor.walletPublicKey !== campaign.auditor_public_key) {
+    throw fail('The signer does not match the configured auditor', 403, 'AUDITOR_MISMATCH');
+  }
+
   try {
     await withDecryptedWalletSecret(
       auditor.walletSecretEncrypted,
